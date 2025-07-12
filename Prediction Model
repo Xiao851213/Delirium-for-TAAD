@@ -798,26 +798,32 @@ cat("\n===== Classification Performance Metrics =====\n")
 print(performance_metrics)
 
 
-# 4. Hosmer-Lemeshow Goodness-of-Fit Test (Chi-square Value and P-value)
+# 4. Hosmer-Lemeshow Goodness-of-Fit Test (Including 'g' Groups)
+hl_test <- hoslem.test(data_val_processed$y, pred_prob, g = g_recommended)  # Original test
 hl_chisq <- hl_test$statistic[[1]]  # Extract chi-square value
-hl_p_value <- hl_test$p.value
+hl_p_value <- hl_test$p.value       
+hl_g <- hl_test$g  # NEW: Extract number of groups (g) from test object
+
 cat("\n===== Hosmer-Lemeshow Goodness-of-Fit Test =====\n")
+cat(sprintf("Number of groups (g): %d\n", hl_g))  # Print 'g' value
 cat(sprintf("Chi-square value: %.3f\n", hl_chisq))
 cat(sprintf("P-value: %.4f\n", hl_p_value))
 
 
-# 5. Save All Metrics to CSV File
+# 5. Save All Metrics to CSV File (Including 'g' Value)
 output_metrics <- data.frame(
   Metric = c(
     "C-index", "C-index_95CI_lower", "C-index_95CI_upper",
     "Risk_Cutoff",
     "Accuracy", "Precision", "Recall", "Specificity", "F1", "Kappa",
+    "Hosmer-Lemeshow_g",  # NEW: Add 'g' to output
     "Hosmer-Lemeshow_Chi2", "Hosmer-Lemeshow_Pvalue"
   ),
   Value = c(
     round(c_index, 3), round(c_index_ci[1], 3), round(c_index_ci[3], 3),
     round(risk_cutoff, 3),
     performance_metrics$Value,
+    hl_g,  # Include 'g' value in output
     round(hl_chisq, 3), round(hl_p_value, 4)
   )
 )
