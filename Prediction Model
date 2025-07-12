@@ -1,0 +1,767 @@
+#R_code_prediction_model_optimized_final_pro
+# ------------------------- Clinical Prediction Model Full Workflow Code (Research Complete Version) ---------------------- #
+# Target Variable: y | All Intermediate Results Saved | Complies with TRIPOD Type 2a Standard
+#----------------------------------------------------------------------------#
+
+### 0. Environment Initialization ------------------------------------------------------------
+rm(list = ls())
+if (!dir.exists("./data_r")) dir.create("./data_r", recursive = TRUE)
+
+dir <- ('D:/Document/HXJ/R_data/LuShan/Submit/01_Jama_Network_Open/')
+setwd(dir)
+
+# Load required packages
+pacman::p_load(
+  tidyverse, rstanarm, pROC, bayestestR, caret, 
+  bayesplot, ggpubr, writexl, gtsummary, patchwork, emmeans, gridExtra
+
+)
+# Limit parallel computing cores
+options(mc.cores = min(4, parallel::detectCores()))
+set.seed(2023)
+
+
+
+### 1. Data Preprocessing ------------------------------------------------------------
+# 1.1 Data Loading and Validation
+tryCatch({
+  data_raw <- read_csv("./data_r/data_model.csv", 
+                      col_types = cols(.default = col_guess())) %>%
+    mutate(across(where(is.character), as_factor))
+}, error = function(e) stop("Data loading failed: ", e$message))
+
+# Additional column name validation
+stopifnot("Missing y variable in data" = "y" %in% names(data_raw))
+
+required_vars <- c("y", "AKI_Post", "Age", "Drinking", "TBil_Pre", 
+                   "APACHE_Post", "MV_time_Post", "Analgesics_Post")
+stopifnot(
+  "Missing required variables" = all(required_vars %in% names(data_raw)),
+  "Target variable y must be binary" = all(data_raw$y %in% c(0, 1))
+)
+
+# 1.2 Data Transformation (with missing value checks)
+data_model <- data_raw %>%
+  mutate(
+    AKI_Post = factor(AKI_Post, levels = c("None", "Stage1", "Stage2", "Stage3")) %>%
+      fct_relevel("None"),
+    across(c(Drinking, Analgesics_Post), ~ factor(.x, 0:1, c("No", "Yes"))),
+    across(c(Age, TBil_Pre, APACHE_Post, MV_time_Post), 
+           ~ {
+             if (any(is.na(.x))) warning("Variable contains missing values: ", cur_column())
+             as.numeric(scale(.x))
+           })
+  ) %>%
+  select(y, everything())  # Confirm y exists
+ 
+
+# Validate factor reference levels
+stopifnot(levels(data_model$AKI_Post)[1] == "None")
+
+# 1.3 Defensive Checks
+stopifnot(
+  "Illegal data types present" = !any(map_lgl(data_model, ~is.list(.) || is.matrix(.))),
+  "Invalid AKI_Post levels" = all(levels(data_model$AKI_Post) %in% 
+                          c("None", "Stage1", "Stage2", "Stage3")),
+  "AKI_Post should be an unordered factor" = !is.ordered(data_model$AKI_Post)
+)
+
+aki_dist <- table(data_model$AKI_Post)
+print("Sample size of each AKI_Post level：")
+print(aki_dist)
+if (aki_dist["Stage3"] < 5) {
+  warning("too less sample for AKI_PostStage3 (<5)")
+}
+
+# 1.4 save data
+write_csv(data_model, "./data_r/1_preprocessed_data.csv")
+write_xlsx(
+  tibble(
+    Variable = names(data_model),
+    Type = map_chr(data_model, ~class(.)[1]),
+    Levels = map_int(data_model, ~ifelse(is.factor(.), nlevels(.), NA))
+  ),
+  "./data_r/1a_data_dictionary.xlsx"
+)
+
+### 2. Bayesian Modeling ------------------------------------------------------------
+# 2.1 Model Formula
+model_formula <- y ~ Age + Drinking + TBil_Pre + APACHE_Post + 
+  AKI_Post + MV_time_Post + Analgesics_Post
+
+# 2.2 Model Fitting (with weakly informative priors)
+bayes_model <- stan_glm(
+  formula = model_formula,
+  family = binomial(),
+  data = data_model,
+  prior = normal(scale = ifelse(grepl("AKI_Post", names(data_model)), 0.5, 1), autoscale = TRUE),
+  prior_intercept = normal(scale = 1.5),
+  contrasts = list(AKI_Post = "contr.treatment"),
+  QR = TRUE,
+  chains = 4,
+  iter = 15000,  
+  warmup = 5000,
+  adapt_delta = 0.999,
+  seed = 2023,
+  refresh = 0
+)
+
+# 2.3 save model
+saveRDS(bayes_model, "./data_r/2_model_fit.rds")
+model_summary <- as_tibble(summary(bayes_model), rownames = "Parameter") %>%
+  rename(
+    Estimate = mean,
+    SD = sd,
+    CI_low = `10%`,
+    CI_high = `90%`,
+    ESS = n_eff
+  ) %>%
+  select(Parameter, Estimate, SD, CI_low, CI_high, Rhat, ESS)
+
+write_csv(model_summary, "./data_r/2a_model_summary.csv")
+
+### 3. Model Diagnostics --------------------------------------------------------------
+# 3.1 Convergence Diagnostics (including intercept)
+selected_params <- c("(Intercept)", "Age", "DrinkingYes", "TBil_Pre", 
+                    "APACHE_Post", "AKI_PostStage1", "AKI_PostStage2", 
+                    "AKI_PostStage3", "MV_time_Post", "Analgesics_PostYes")
+
+full_conv_plot <- mcmc_trace(bayes_model, 
+                           pars = selected_params,
+                           facet_args = list(ncol = 4)) +
+  labs(title = "MCMC Trace Plots of Key Parameters", 
+       subtitle = "All Predictors") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        strip.text = element_text(size = 9)) +
+  theme(text = element_text(family = "Arial"))
+ 
+aki_conv_plot <- mcmc_trace(bayes_model, 
+                          pars = c("AKI_PostStage1", "AKI_PostStage2", "AKI_PostStage3")) +
+  labs(title = "MCMC Traces of AKI Stage Parameters") +
+  theme_bw(base_size = 11)
+
+# 3.2 save diagnostic report
+conv_report <- describe_posterior(bayes_model) %>%
+  filter(!str_detect(Parameter, "Intercept")) %>%
+  select(Parameter, Median, CI_low, CI_high, Rhat, ESS) %>%
+  mutate(
+    Variable = case_when(
+      str_detect(Parameter, "AKI_Post") ~ "AKI_Post",
+      str_detect(Parameter, "Yes$") ~ str_extract(Parameter, "^[A-Za-z_]+"),
+      TRUE ~ Parameter
+    ),
+    Convergence = case_when(
+      Rhat > 1.01 ~ "Need check",
+      Rhat > 1.05 ~ "Bad",
+      TRUE ~ "Good"
+    )
+  ) %>%
+  arrange(Variable, Parameter)
+
+write_xlsx(conv_report, "./data_r/3a_enhanced_convergence_report.xlsx")
+
+# 3.3 save diagnostic plots
+ggsave("./data_r/3b_full_convergence_plot.pdf", full_conv_plot, 
+       width = 12.5, height = 7.5, units = "in", device = cairo_pdf, family = "Arial")  # 指定字体
+ggsave("./data_r/3c_aki_convergence_plot.pdf", aki_conv_plot, 
+       width = 7.5, height = 3, units = "in", device = cairo_pdf, family = "Arial")  # 指定字体
+
+### 4. Performance Evaluation --------------------------------------------------------------
+
+# 4.1 Calibration Curve Calculation (dynamic binning)
+compute_calibration <- function(model, data, n_bins = 15) {
+  probs <- posterior_epred(model)
+  #probs <- probs[probs > 0 & probs < 1]  
+  quantile_bins <- quantile(probs, probs = seq(0, 1, length.out = n_bins + 1))
+  map_df(1:2000, ~{
+    data %>%
+      mutate(pred = probs[.x, ]) %>%
+      mutate(bin = cut(pred, breaks = quantile_bins)) %>%
+      group_by(bin) %>%
+      summarise(mean_pred = mean(pred), mean_obs = mean(y), .groups = "drop")
+  }) %>%
+    group_by(bin) %>%
+    summarise(
+      pred_mid = median(mean_pred),
+      obs_median = median(mean_obs),
+      obs_lower = quantile(mean_obs, 0.025),
+      obs_upper = quantile(mean_obs, 0.975)
+    )
+}
+
+cal_data_train <- compute_calibration(bayes_model, data_model)
+write_csv(cal_data_train, "./data_r/4a_calibration_data_train.csv")
+
+# 4.2 visualization
+cal_plot_train <- ggplot(cal_data_train, aes(pred_mid, obs_median)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = 2) +
+  geom_ribbon(aes(ymin = obs_lower, ymax = obs_upper), fill = "#4B9CD3", alpha = 0.2) +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  geom_point(shape = 21, fill = "white", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "#009E73", linetype = "dashed") +
+  annotate("text", x = 0.15, y = 0.9, 
+           label = paste0("Slope = ", round(coef(lm(obs_median ~ pred_mid, data = cal_data_train))[2], 3)),
+           color = "#D55E00", size = 4) +
+  labs(title = "Model Calibration with 95% CI",
+       x = "Predicted Probability", y = "Observed Proportion") +
+  scale_x_continuous(limits = c(0,1), breaks = seq(0,1,0.2)) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.01)) +
+  theme(text = element_text(family = "Arial"))  
+
+ggsave("./data_r/4b_calibration_plot_train.pdf", cal_plot_train, 
+       width = 4, height = 3.2, units = "in", device = cairo_pdf, family = "Arial")  
+
+ 
+### 5. Clinical Interpretation --------------------------------------------------------------
+# 5.1 Effect Scale
+#full_effect_table
+full_effect_table <- model_summary %>%
+  filter(
+    Parameter %in% c(
+      "(Intercept)", "Age", "DrinkingYes", "TBil_Pre", 
+      "APACHE_Post", "AKI_PostStage1", "AKI_PostStage2", 
+      "AKI_PostStage3", "MV_time_Post", "Analgesics_PostYes"
+    )
+  ) %>%
+  mutate(
+    OR_Median = exp(Estimate),  
+    OR_CI_low = exp(CI_low),
+    OR_CI_high = exp(CI_high)
+  ) %>%
+  select(
+    Parameter,
+    Median = OR_Median,  
+    CI_low = OR_CI_low,
+    CI_high = OR_CI_high
+  ) %>%
+  mutate(
+    Parameter = case_when(
+      str_detect(Parameter, "AKI_Post") ~ str_replace(Parameter, "AKI_Post", "AKI Stage "),
+      TRUE ~ Parameter
+    )
+  )
+
+write_xlsx(full_effect_table, "./data_r/5a_full_effect_table.xlsx")
+
+# 5.2 AKI Effect Scale
+aki_effects <- model_summary %>%
+  filter(str_detect(Parameter, "AKI_Post")) %>%
+  mutate(
+    Comparison = case_when(
+      Parameter == "AKI_PostStage1" ~ "Stage1 vs None",
+      Parameter == "AKI_PostStage2" ~ "Stage2 vs None",
+      Parameter == "AKI_PostStage3" ~ "Stage3 vs None"
+    ),
+    OR = round(exp(Estimate), 2),
+    OR_CI = sprintf("%.2f-%.2f", exp(CI_low), exp(CI_high))
+  ) %>%
+  select(Comparison, OR, CI_low, CI_high, OR_CI, Rhat, ESS)  
+
+write_xlsx(aki_effects, "./data_r/5b_aki_effect_table.xlsx")
+
+# 5.3 full forest plot
+full_forest_plot <- full_effect_table %>%
+  filter(!str_detect(Parameter, "Intercept")) %>%
+  ggplot(aes(Median, fct_reorder(Parameter, Median))) +
+  geom_vline(xintercept = 1, color = "grey40", linetype = 2) +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high), 
+                  color = "#0072B2", size = 0.3) +
+  scale_x_log10(breaks = c(0.5, 1, 2, 4)) +
+  labs(title = "Full Model Predictor Effects", 
+       x = "Adjusted Odds Ratio (95% CrI)", y = "") +
+  theme_bw(base_size = 11) +
+  theme(text = element_text(family = "Arial"))  
+
+ggsave("./data_r/5c_full_forest_plot.pdf", full_forest_plot, 
+       width = 4.5, height = 3.2, device = cairo_pdf, family = "Arial")  
+
+# 5.4 AKI forest plot
+aki_forest_plot <- aki_effects %>%
+  ggplot(aes(x = OR, y = fct_rev(Comparison))) +
+  geom_vline(xintercept = 1, color = "grey50", linetype = 2) +
+  geom_pointrange(aes(xmin = exp(CI_low), xmax = exp(CI_high)), 
+                  color = "#0072B2", size = 0.5) +
+  geom_text(aes(label = paste0(OR, " (", OR_CI, ")")), 
+            vjust = -0.5, size = 3) +
+  scale_x_log10(breaks = c(0.5, 1, 2, 5, 10)) +
+  labs(title = "AKI Stage-specific Effects",
+       x = "Odds Ratio (95% CrI)", 
+       y = "") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank()) +
+  theme(text = element_text(family = "Arial")) 
+
+ggsave("./data_r/5d_aki_forest_plot.pdf", aki_forest_plot, 
+       width = 4, height = 3.2, units = "in", device = cairo_pdf, family = "Arial") 
+
+# 5.3  AKI stage contraction
+aki_contrasts <- pairs(
+  emmeans(bayes_model, specs = "AKI_Post"),
+  reverse = TRUE,
+  type = "response"
+) %>%
+  as_tibble() %>%
+  mutate(
+    Contrast = str_replace(contrast, " / ", " vs "),
+    OR = sprintf("%.2f (%.2f-%.2f)", odds.ratio, lower.HPD, upper.HPD)
+  ) %>%
+  select(Contrast, OR)
+
+write_xlsx(aki_contrasts, "./data_r/5e_AKI_contrasts.xlsx")
+
+
+### 6.  Model Validation --------------------------------------------------------------
+# 6.1 AUC analysis
+train_auc <- apply(posterior_epred(bayes_model), 1, 
+                  function(x) roc(data_model$y, x)$auc) %>%
+  as.numeric()
+ 
+write_csv(
+  tibble(
+    Iteration = seq_along(train_auc), 
+    AUC = train_auc
+  ),
+  "./data_r/6a_auc_distribution.csv"
+)
+
+# 6.2 visualization
+density_data <- density(train_auc)
+peak_auc <- density_data$x[which.max(density_data$y)]
+ 
+auc_plot <- ggplot(tibble(AUC = train_auc), aes(x = AUC)) + 
+  geom_density(fill = "#009E73", alpha = 0.6) +
+  geom_vline(xintercept = peak_auc, color = "#0072B2", linetype = "dotted") +
+  annotate("text", x = peak_auc - 0.015, y = max(density_data$y) * 0.9,  
+           label = paste0("Peak = ", round(peak_auc, 3)), 
+           color = "#0072B2", hjust = 0) +
+  labs(title = "AUC Posterior Distribution", 
+       x = "Area Under the Curve", y = "Density") +
+  theme_bw(base_size = 11) +
+  theme(text = element_text(family = "Arial"))
+
+ggsave("./data_r/6b_auc_plot.pdf", auc_plot, 
+       width = 4, height = 3.2, units = "in", device = cairo_pdf, family = "Arial")  
+
+p1 <- gridExtra::tableGrob(aki_contrasts, rows = NULL) 
+p2 <- ggplotify::as.ggplot(p1) +ggtitle('Contrast of AKI Stages')+theme(plot.title = element_text(hjust = 0.25))
+ggsave("./data_r/6c_contrast_plot.pdf", p2, 
+       width = 4, height = 3.2, units = "in", device = cairo_pdf, family = "Arial")  
+
+
+ 
+
+
+### 7. Result Integration --------------------------------------------------------------
+
+# 7.1 Merge Final Report (adjusted layout and dimensions)
+library(ggplot2)
+library(patchwork)
+
+final_report <- (
+  (full_conv_plot ) /
+  ( cal_plot_train | full_forest_plot | auc_plot |
+  gridExtra::tableGrob(aki_contrasts, rows = NULL) )
+) +
+  plot_annotation(tag_levels = "A") +
+  plot_layout(heights = c(3, 1))  
+
+ggsave("./data_r/7b_final_report.pdf", final_report, 
+       width = 14, height = 10, units = "in", device = cairo_pdf, family = "Arial")  
+
+
+#R_code_prediction_model_validation
+library(rstanarm)    # Bayesian models
+library(pROC)        # AUC calculation
+library(ResourceSelection) # Hosmer-Lemeshow test
+library(caret)       # Confusion matrices
+library(survival)    # C-index calculation
+
+# Validation set preprocessing (consistent with training set)
+data_val_raw <- read.csv( "./data_r/data_valid.csv" )
+data_val_processed <- data_val_raw %>%
+  mutate(
+    AKI_Post = factor(AKI_Post, levels = c("None", "Stage1", "Stage2", "Stage3")) %>%
+      fct_relevel("None"),
+    across(c(Drinking, Analgesics_Post), ~ factor(.x, 0:1, c("No", "Yes"))),
+    across(c(Age, TBil_Pre, APACHE_Post, MV_time_Post), 
+           ~ {
+             if (any(is.na(.x))) warning("Variable contains missing values: ", cur_column())
+             as.numeric(scale(.x))
+           })
+  ) %>%
+  select(y, everything())  # Confirm y exists
+ 
+
+# Extract model formula
+model_formula <- formula(bayes_model)
+
+pred_prob <- posterior_epred(bayes_model, newdata = data_val_processed) %>% 
+  colMeans()
+hist(pred_prob, breaks = 20, main = "Validation Set Predicted Probabilities")
+
+n_events <- sum(data_val_processed$y)
+# Dynamically set grouping number (ensure ≥5 events per group)
+g_recommended <- min(10, floor(n_events / 5))
+if (g_recommended < 5) g_recommended <- 5  # Minimum group number set to 5
+hl_test <- hoslem.test(data_val_processed$y, pred_prob, g = g_recommended)
+cat("Hosmer-Lemeshow test:\n",
+    "Chi-square  =", hl_test$statistic, " p-value =", hl_test$p.value, "\n")
+
+
+roc_obj <- pROC::roc(
+  response = data_val_processed$y,
+  predictor = pred_prob,
+  levels = c(0, 1),          # Explicitly specify event levels
+  direction = "<"            # Force direction (higher probability predicts event)
+)
+
+auc_value <- pROC::auc(roc_obj)
+auc_ci <- pROC::ci(roc_obj, method = "delong")
+cat(sprintf("AUC: %.3f (95%% CI: %.3f-%.3f)", 
+            auc_value, auc_ci[1], auc_ci[3]))
+
+ 
+# Optimal threshold determination (Youden's index)
+optimal_threshold <- coords(roc_obj, "best", ret = "threshold", best.method = "youden")
+cat("\nOptimal risk threshold: ", optimal_threshold$threshold, "\n")
+
+optimal_idx <- which.max(roc_obj$sensitivities + roc_obj$specificities - 1)
+optimal_threshold <- roc_obj$thresholds[optimal_idx]
+cat(sprintf("\n\nOptimal judgment threshold：%.3f", optimal_threshold))
+ 
+# Confusion matrix calculation
+pred_class <- ifelse(pred_prob >= optimal_threshold, 1, 0)
+cm <- confusionMatrix(factor(pred_class, levels = c(0,1)), 
+                     factor(data_val_processed$y, levels = c(0,1)))
+
+# Performance metric extraction
+metrics <- data.frame(
+  Accuracy = cm$overall["Accuracy"],
+  Precision = cm$byClass["Pos Pred Value"],
+  Recall = cm$byClass["Sensitivity"],
+  Specificity = cm$byClass["Specificity"],
+  F1 = cm$byClass["F1"],
+  Kappa = cm$overall['Kappa']
+)
+print(round(metrics, 3))
+ 
+# Risk threshold explanation
+cat("\nRisk classification criteria：",
+    "\n- Low risk: Predicted probability <", optimal_threshold,
+    "\n- High risk: Predicted probability ≥", optimal_threshold)
+
+confusion_plot <- ggplot(data = as.data.frame(cm$table), 
+                         aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white", alpha = 0.8) +
+  geom_text(aes(label = sprintf("%d\n(%.1f%%)", Freq, 100 * Freq/sum(Freq))), 
+            color = "black", size = 4.5) +
+  scale_fill_gradient(low = "#F0F8FF", high = "#4682B4", name = "Count") +
+  labs(title = "Confusion Matrix", 
+       x = "Actual Class", 
+       y = "Predicted Class") +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(color = "black"),
+    legend.position = "none"
+  ) +
+  scale_x_discrete(labels = c("0 (Negative)", "1 (Positive)")) +
+  scale_y_discrete(labels = c("0 (Negative)", "1 (Positive)"))
+ 
+# save pdf file
+ggsave("./data_r/8a_confusion_matrix_plot.pdf", 
+       confusion_plot, 
+       width = 5, 
+       height = 4, 
+       units = "in", 
+       device = cairo_pdf)
+
+
+
+AUC_plot_val <- ggroc(roc_obj, color = "#1c61b6") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  annotate("text", x = 0.7, y = 0.6,
+           label = paste0("AUC = ", round(auc_value, 3))) +
+  labs(title = "AUC of Model Prediction" ) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.01)) +
+  theme(text = element_text(family = "Arial"))  
+AUC_plot_val
+ggsave("./data_r/8b_AUC_plot_val.pdf", AUC_plot_val, 
+       width = 5, height = 4, units = "in", device = cairo_pdf, family = "Arial") 
+
+
+model_formula <- formula(bayes_model)
+pred_prob <- posterior_epred(bayes_model, newdata = data_val_processed) %>% 
+  colMeans()
+
+data_val <- data_val_processed
+calibration_df <- data.frame(
+  pred_prob = pred_prob,
+  outcome = data_val$y
+)
+mae <- mean(abs(calibration_df$pred_prob - calibration_df$outcome))
+loess_fit <- loess(outcome ~ pred_prob, data = calibration_df, span = 0.75)
+x_dense <- seq(0, 1, length.out = 1000)
+y_dense <- predict(loess_fit, newdata = data.frame(pred_prob = x_dense))
+
+diff <- abs(y_dense - x_dense)
+
+valid_indices <- which(
+  diff < 0.02 &       
+  x_dense >= 0.1 &    
+  x_dense <= 0.9      
+)
+
+risk_zones <- list(
+  low = c(0.1, 0.4),
+  #medium = c(0.5, 0.8),
+  high = c(0.8, 1)
+)
+
+cross_points <- sapply(risk_zones, function(z) {
+  idx <- which(x_dense >= z[1] & x_dense <= z[2])
+  if (length(idx) == 0) return(NA)
+  best_sub <- idx[which.min(diff[idx])]
+  x_dense[best_sub]
+})
+
+# ----------------------------
+cal_plot <- ggplot(calibration_df, aes(x = pred_prob, y = outcome)) +
+  geom_smooth(method = "loess", formula = y ~ x, 
+              se = FALSE, color = "#D55E00", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  {if(length(cross_points) > 0) 
+    geom_vline(xintercept = cross_points, 
+               linetype = "dashed", color = "#0072B2", linewidth = 0.6)} +
+  {if(length(cross_points) > 0) 
+    lapply(seq_along(cross_points), function(i) {
+      annotate("text", 
+               x = cross_points[i] - 0.25, 
+               y = 0.65 - 0.1*(i-1),  
+               label = sprintf("Threshold %d = %.2f", i, cross_points[i]), 
+               color = "#0072B2", 
+               hjust = 0, 
+               size = 5)
+    })} +
+  annotate("text", x = 0.35, y = 0.15, 
+           label = sprintf("MAE = %.3f", mae),
+           color = "#0072B2", size = 5, hjust = 0) +
+  labs(title = "Model Calibration by LOESS", x = "Predicted Probability", y = "Observed Probability") +
+  coord_cartesian(xlim = c(0,1), ylim = c(0,1))+
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.01)) +
+  theme(text = element_text(family = "Arial"))  
+
+print(cal_plot)
+ggsave("./data_r/9a_cal_plot_val.pdf", cal_plot, 
+       width = 5, height = 4, units = "in", device = cairo_pdf, family = "Arial") 
+
+
+data_val <- data_val_processed
+ 
+compute_calibration <- function(model, data, n_bins = 15) {
+  probs <- posterior_epred(model, newdata = data)
+  
+  if (sd(probs) < 0.01) {  
+    warning("The predicted probability distribution is too concentrated, enabling an alternative binning strategy")
+    breaks <- seq(0, 1, length.out = n_bins + 1)  
+  } else {
+    breaks <- unique(quantile(probs, probs = seq(0, 1, 1/n_bins), na.rm = TRUE))
+    if (length(breaks) < 3) breaks <- seq(min(probs), max(probs), length.out = 5)
+  }
+  
+  map_df(1:500, ~{
+    data %>%
+      mutate(pred = probs[.x, ]) %>%
+      mutate(bin = cut(pred, breaks = breaks, include.lowest = TRUE)) %>%
+      group_by(bin) %>%
+      summarise(mean_pred = mean(pred), mean_obs = mean(y), .groups = "drop")
+  }) %>%
+    group_by(bin) %>%
+    summarise(
+      pred_mid = median(mean_pred),
+      obs_median = median(mean_obs),
+      obs_lower = quantile(mean_obs, 0.025),
+      obs_upper = quantile(mean_obs, 0.975)
+    )
+}
+
+cal_data_val <- compute_calibration(bayes_model, data_val)
+write_csv(cal_data_val, "./data_r/9b_calibration_data_validation.csv")
+
+cal_plot_val <- ggplot(cal_data_val, aes(pred_mid, obs_median)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = 2) +
+  geom_ribbon(aes(ymin = obs_lower, ymax = obs_upper), fill = "#4B9CD3", alpha = 0.2) +
+  geom_line(color = "#D55E00", linewidth = 0.8) +
+  geom_point(shape = 21, fill = "white", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "#009E73", linetype = "dashed") +
+  annotate("text", x = 0.15, y = 0.9, 
+           label = paste0("Slope = ", round(coef(lm(obs_median ~ pred_mid, data = cal_data_val))[2], 3)),
+           color = "#D55E00", size = 4) +
+  labs(title = "Model Calibration with 95% CI by Binning Method",
+       x = "Predicted Probability", y = "Observed Proportion") +
+  scale_x_continuous(limits = c(0,1), breaks = seq(0,1,0.2)) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.01)) +
+  theme(text = element_text(family = "Arial"))  
+cal_plot_val 
+ggsave("./data_r/9c_calibration_plot_val.pdf", cal_plot_val, 
+       width = 5, height = 4, units = "in", device = cairo_pdf, family = "Arial")  
+
+
+
+
+
+model_formula <- formula(bayes_model) 
+print(model_formula) 
+
+library(rmda)
+
+cv_preds <- numeric(nrow(data_val))
+for(i in 1:nrow(data_val)){
+  model_cv <- stan_glm(
+    formula = model_formula,
+    family = binomial(),
+    data = data_val[-i, ],
+    prior = normal(scale = 1),
+    refresh = 0,
+    chains = 2,
+    iter = 4000
+  )
+  cv_preds[i] <- apply(posterior_epred(model_cv, newdata = data_val[i, ]), 2, median)
+}
+
+
+data_val <- data_val %>% 
+  mutate(cv_preds = cv_preds) 
+dca_data <- decision_curve(
+  y ~ cv_preds,
+  data = data_val,
+  thresholds = seq(0.05, 0.95, by = 0.01),
+  bootstraps = 1000,
+  population.prevalence	 = 0.318,
+  study.design = "case-control"  
+)
+
+
+colnames(dca_data$derived.data) 
+dca_result <- dca_data$derived.data
+dca_result <- as.data.frame(dca_result)
+ 
+
+prevalence <- mean(data_model$y == 1)  
+
+dca_df <- data.frame(
+  thresholds = dca_data$derived.data$thresholds,
+  Model_NB = dca_data$derived.data$NB,
+  Model_NB_lower = dca_data$derived.data$NB_lower,
+  Model_NB_upper = dca_data$derived.data$NB_upper,
+  nonDP = dca_data$derived.data$nonDP,
+  DP = dca_data$derived.data$DP
+) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  mutate(
+    prevalence = 1 - nonDP,
+    TreatAll_NB = prevalence - (1 - prevalence)  * thresholds/(1 - thresholds),
+    TreatNone_NB = 0
+  )
+
+ dca_df <- dca_df[c(1:91),]
+
+
+dca_plot <- ggplot(
+#subset(dca_df, Model_NB_lower>0),
+dca_df, 
+aes(x = thresholds)) +
+  geom_line(aes(y = Model_NB, color = "Proposed Model"), linewidth = 0.8) +
+  geom_ribbon(aes(ymin = Model_NB_lower, ymax = Model_NB_upper), 
+              fill = "#0072B2", alpha = 0.2) +
+  geom_line(aes(y = TreatAll_NB, color = "Treat All"), linetype = 2) +
+  geom_line(aes(y = TreatNone_NB, color = "Treat None"), linetype = 3) +
+  scale_color_manual(
+    name = "",
+    values = c("Proposed Model" = "#0072B2", 
+               "Treat All" = "black", 
+               "Treat None" = "grey50"),
+    breaks = c("Proposed Model", "Treat All", "Treat None")
+  ) +
+  labs(
+    title = "Decision Curve Analysis",
+    x = "Probability Threshold (%)",
+    y = "Standardized Net Benefit"
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0.05, 1, by = 0.05)
+  ) +
+  scale_y_continuous(limits = c(-1, 1))+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = c(0.8, 0.8),       
+    panel.grid.major = element_line(color = "grey90")
+  )
+
+dca_plot
+
+
+write_csv(dca_df,
+  "./data_r/10a_decision_curve_data.csv"
+)
+ 
+ggsave("./data_r/10b_decision_curve_plot.pdf", dca_plot, 
+       width = 7.5, height = 4, units = "in", device = cairo_pdf)
+
+### 11. Result Integration --------------------------------------------------------------
+
+# Merge Final Report (adjusted layout and dimensions)
+library(ggplot2)
+library(patchwork)
+
+final_report1 <- (full_conv_plot  | ( cal_plot_train / auc_plot / full_forest_plot))+ plot_layout( widths = c(3, 1))
+
+final_report <- (
+  final_report1
+  / (dca_plot | AUC_plot_val) 
+  / (confusion_plot | cal_plot_val | cal_plot) 
+) +
+  plot_annotation(tag_levels = "A",
+     theme = theme(
+      plot.tag = element_text(
+        size = 48,
+        face = "bold",
+        hjust = -0.1
+      ))) +
+  plot_layout(heights = c(3, 2, 2)
+)  
+
+ggsave("./data_r/11_final_report.pdf", final_report, 
+       width = 18, height = 20, units = "in", device = cairo_pdf, family = "Arial")  
+
+### 8. result validation --------------------------------------------------------------
+required_files <- c(
+  "1_preprocessed_data.csv", "1a_data_dictionary.xlsx",
+  "2_model_fit.rds", "2a_model_summary.csv",
+  "3a_enhanced_convergence_report.xlsx","3b_full_convergence_plot.pdf", "3c_aki_convergence_plot.pdf",
+  "4a_calibration_data_train.csv", "4b_calibration_plot_train.pdf",  
+  "5a_full_effect_table.xlsx", "5b_aki_effect_table.xlsx", "5c_full_forest_plot.pdf", "5d_aki_forest_plot.pdf", "5e_AKI_contrasts.xlsx",
+  "6a_auc_distribution.csv", "6b_auc_plot.pdf", "6c_contrast_plot.pdf", 
+  "7b_final_report.pdf",
+"8a_confusion_matrix_plot.pdf", "8b_AUC_plot_val.pdf", 
+"9a_cal_plot_val.pdf", "9b_calibration_data_validation.csv", "9c_calibration_plot_val.pdf",
+"10a_decision_curve_data.csv", "10b_decision_curve_plot.pdf",
+"11_final_report.pdf"
+)
+
+if (all(file.exists(file.path("./data_r", required_files)))) {
+  message("\n[SUCCESS] ！files menu：")
+  walk(required_files, ~message(sprintf("  - %-40s [✓]", .x)))
+} else {
+  missing_files <- setdiff(required_files, list.files("./data_r"))
+  stop("[ERROR]: ", paste(missing_files, collapse = ", "))
+}
+
+
+
