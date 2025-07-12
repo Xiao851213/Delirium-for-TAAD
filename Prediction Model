@@ -765,3 +765,61 @@ if (all(file.exists(file.path("./data_r", required_files)))) {
 
 
 
+### Supplementary: Calculation and Output of Core Model Evaluation Metrics ###
+
+# 1. C-index (AUC) and its 95% Confidence Interval
+c_index <- auc_value  # Reuse previously calculated AUC as C-index
+c_index_ci <- auc_ci  # 95% CI (delong method)
+cat("\n===== C-index (AUC) =====\n")
+cat(sprintf("C-index: %.3f (95%% CI: %.3f-%.3f)\n", c_index, c_index_ci[1], c_index_ci[3]))
+
+
+# 2. High/Low Risk Cutoff (based on Youden's Index)
+risk_cutoff <- optimal_threshold  # Reuse previously calculated optimal threshold
+cat("\n===== Risk Classification Cutoff =====\n")
+cat(sprintf("High/Low risk cutoff: %.3f\n", risk_cutoff))
+cat(sprintf("- Low risk: Predicted probability < %.3f\n", risk_cutoff))
+cat(sprintf("- High risk: Predicted probability ≥ %.3f\n", risk_cutoff))
+
+
+# 3. Classification Performance Metrics (Accuracy, Precision, Recall, etc.)
+performance_metrics <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "Specificity", "F1", "Kappa"),
+  Value = round(c(
+    metrics$Accuracy,
+    metrics$Precision,
+    metrics$Recall,
+    metrics$Specificity,
+    metrics$F1,
+    metrics$Kappa
+  ), 3)
+)
+cat("\n===== Classification Performance Metrics =====\n")
+print(performance_metrics)
+
+
+# 4. Hosmer-Lemeshow Goodness-of-Fit Test (Chi-square Value and P-value)
+hl_chisq <- hl_test$statistic[[1]]  # Extract chi-square value
+hl_p_value <- hl_test$p.value
+cat("\n===== Hosmer-Lemeshow Goodness-of-Fit Test =====\n")
+cat(sprintf("Chi-square value: %.3f\n", hl_chisq))
+cat(sprintf("P-value: %.4f\n", hl_p_value))
+
+
+# 5. Save All Metrics to CSV File
+output_metrics <- data.frame(
+  Metric = c(
+    "C-index", "C-index_95CI_lower", "C-index_95CI_upper",
+    "Risk_Cutoff",
+    "Accuracy", "Precision", "Recall", "Specificity", "F1", "Kappa",
+    "Hosmer-Lemeshow_Chi2", "Hosmer-Lemeshow_Pvalue"
+  ),
+  Value = c(
+    round(c_index, 3), round(c_index_ci[1], 3), round(c_index_ci[3], 3),
+    round(risk_cutoff, 3),
+    performance_metrics$Value,
+    round(hl_chisq, 3), round(hl_p_value, 4)
+  )
+)
+write.csv(output_metrics, "./data_r/model_performance_metrics.csv", row.names = FALSE)
+cat("\n[SUCCESS] All metrics saved to ./data_r/model_performance_metrics.csv\n")
