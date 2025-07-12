@@ -765,67 +765,70 @@ if (all(file.exists(file.path("./data_r", required_files)))) {
 
 
 
-### Supplementary: Calculation and Output of Core Model Evaluation Metrics ###
+### Supplementary: Core Model Evaluation Metrics (Fixed 'g' Extraction) ###
 
-# 1. C-index (AUC) and its 95% Confidence Interval
-c_index <- auc_value  # Reuse previously calculated AUC as C-index
-c_index_ci <- auc_ci  # 95% CI (delong method)
+# 1. C-index (AUC) and 95% Confidence Interval
+c_index <- auc_value
+c_index_ci <- auc_ci  # Assumes delong CI precomputed
 cat("\n===== C-index (AUC) =====\n")
 cat(sprintf("C-index: %.3f (95%% CI: %.3f-%.3f)\n", c_index, c_index_ci[1], c_index_ci[3]))
 
 
-# 2. High/Low Risk Cutoff (based on Youden's Index)
-risk_cutoff <- optimal_threshold  # Reuse previously calculated optimal threshold
+# 2. Risk Classification Cutoff (Youden's Index)
+risk_cutoff <- optimal_threshold  # Precomputed optimal threshold
 cat("\n===== Risk Classification Cutoff =====\n")
 cat(sprintf("High/Low risk cutoff: %.3f\n", risk_cutoff))
-cat(sprintf("- Low risk: Predicted probability < %.3f\n", risk_cutoff))
-cat(sprintf("- High risk: Predicted probability ≥ %.3f\n", risk_cutoff))
+cat(sprintf("- Low risk: < %.3f | High risk: ≥ %.3f\n", risk_cutoff, risk_cutoff))
 
 
-# 3. Classification Performance Metrics (Accuracy, Precision, Recall, etc.)
+# 3. Classification Performance Metrics
 performance_metrics <- data.frame(
   Metric = c("Accuracy", "Precision", "Recall", "Specificity", "F1", "Kappa"),
-  Value = round(c(
-    metrics$Accuracy,
-    metrics$Precision,
-    metrics$Recall,
-    metrics$Specificity,
-    metrics$F1,
-    metrics$Kappa
-  ), 3)
+  Value = round(c(metrics$Accuracy, metrics$Precision, metrics$Recall, 
+                  metrics$Specificity, metrics$F1, metrics$Kappa), 3)
 )
 cat("\n===== Classification Performance Metrics =====\n")
 print(performance_metrics)
 
 
-# 4. Hosmer-Lemeshow Goodness-of-Fit Test (Including 'g' Groups)
-hl_test <- hoslem.test(data_val_processed$y, pred_prob, g = g_recommended)  # Original test
-hl_chisq <- hl_test$statistic[[1]]  # Extract chi-square value
-hl_p_value <- hl_test$p.value       
-hl_g <- hl_test$g  # NEW: Extract number of groups (g) from test object
+# 4. Hosmer-Lemeshow Test (Using Predefined 'g_recommended')
+## Step 1: Recompute/verify dynamic group count (g)
+n_events <- sum(data_val_processed$y)  # Total outcome events
+g_recommended <- min(10, floor(n_events / 5))  # Max 10 groups, min 5 events/group
+if (g_recommended < 5) g_recommended <- 5  # Enforce minimum 5 groups
 
+## Step 2: Execute test with 'g_recommended'
+hl_test <- hoslem.test(data_val_processed$y, pred_prob, g = g_recommended)
+hl_chisq <- hl_test$statistic[[1]]
+hl_p_value <- hl_test$p.value
+
+## Step 3: Print 'g' using the PREDEFINED variable (Method 1)
 cat("\n===== Hosmer-Lemeshow Goodness-of-Fit Test =====\n")
-cat(sprintf("Number of groups (g): %d\n", hl_g))  # Print 'g' value
-cat(sprintf("Chi-square value: %.3f\n", hl_chisq))
-cat(sprintf("P-value: %.4f\n", hl_p_value))
+cat(sprintf("Number of groups (g): %d\n", g_recommended))  # Directly use g_recommended
+cat(sprintf("Chi-square: %.3f | P-value: %.4f\n", hl_chisq, hl_p_value))
 
 
-# 5. Save All Metrics to CSV File (Including 'g' Value)
+# 5. Save Metrics to CSV (Including 'g_recommended')
 output_metrics <- data.frame(
   Metric = c(
     "C-index", "C-index_95CI_lower", "C-index_95CI_upper",
     "Risk_Cutoff",
     "Accuracy", "Precision", "Recall", "Specificity", "F1", "Kappa",
-    "Hosmer-Lemeshow_g",  # NEW: Add 'g' to output
+    "Hosmer-Lemeshow_g",  # Now uses g_recommended
     "Hosmer-Lemeshow_Chi2", "Hosmer-Lemeshow_Pvalue"
   ),
   Value = c(
     round(c_index, 3), round(c_index_ci[1], 3), round(c_index_ci[3], 3),
     round(risk_cutoff, 3),
-    performance_metrics$Value,
-    hl_g,  # Include 'g' value in output
+    performance_metrics$Value,  # 6 metrics (Accuracy to Kappa)
+    g_recommended,  # Explicitly use the predefined group count
     round(hl_chisq, 3), round(hl_p_value, 4)
-  )
+  ),
+  check.names = FALSE  # Preserve metric names with hyphens
 )
+
+# Validate row count (should return 13 rows)
+if (nrow(output_metrics) != 13) stop("Mismatched rows in output_metrics!")
+
 write.csv(output_metrics, "./data_r/model_performance_metrics.csv", row.names = FALSE)
-cat("\n[SUCCESS] All metrics saved to ./data_r/model_performance_metrics.csv\n")
+cat("\n[SUCCESS] Metrics saved to ./data_r/model_performance_metrics.csv\n")
